@@ -2075,10 +2075,16 @@ def page_profile(df: pd.DataFrame, year: str = "2024-25"):
                  key="year_Institution Profile", label_visibility="collapsed")
 
     names = sorted(df["DISPLAY_NAME"].dropna().unique().tolist())
-    # Open on the Institution of Interest (focus_display is a DISPLAY_NAME,
-    # the same value this selectbox lists). Falls back to the placeholder when
+    # Open on the sidebar Institution of Interest. Resolve it by UNITID against the
+    # current year's data so it works even when display names differ across years;
+    # a local pick (sel_inst) still overrides. Falls back to the placeholder when
     # no Institution of Interest has been chosen.
-    pre = st.session_state.get("sel_inst") or st.session_state.get("focus_display") or None
+    pre = st.session_state.get("sel_inst")
+    if not pre or pre not in names:
+        _fuid = _focus_uid()
+        if _fuid is not None:
+            _m = df[df["UNITID"] == _fuid]
+            pre = _m.iloc[0]["DISPLAY_NAME"] if not _m.empty else None
     default_idx = (names.index(pre) + 1) if pre and pre in names else 0
     sel = st.selectbox("Search for an institution", ["— select an institution —"] + names,
                        index=default_idx)
