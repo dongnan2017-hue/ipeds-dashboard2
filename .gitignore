@@ -1,6 +1,14 @@
 
-# Database (large — hosted on Google Drive instead)
+# Database (large — hosted on Google Drive instead) & backups
 ipeds.duckdb
+*.duckdb
+*.duckdb.bak
+*.bak
+
+# Source IPEDS Access databases & NCES docs (local only — never commit; >100 MB)
+*.accdb
+*.xlsx
+*.docx
 
 # Streamlit secrets (contains Google Drive file ID)
 .streamlit/secrets.toml

@@ -38,7 +38,6 @@ def _trend_kw() -> dict:
 # Paths relative to this file — works locally and on Streamlit Cloud
 _HERE       = os.path.dirname(os.path.abspath(__file__))
 DB_PATH     = os.path.join(_HERE, "ipeds.duckdb")
-COHORT_PATH = os.path.join(_HERE, "grouping.csv")
 
 
 def _db_is_valid() -> bool:
@@ -154,6 +153,25 @@ CONTROL_COLORS = {
     "Private for-profit": "#D97706",   # warm amber
     "Not available":      "#94A3B8",   # slate gray
 }
+
+# ── Focus institution (shared pages highlight this one) ──────────────────────
+# The "College of Interest" selector in the sidebar sets focus_unitid / focus_name
+# in session_state. When nothing is chosen these return None / "" and the shared
+# pages simply draw no highlight. ALBION_UNITID is retained only to gate the
+# Albion-specific narrative on the National Overview scatter explorer.
+ALBION_UNITID = 168546
+
+def _focus_uid():
+    """UNITID of the chosen College of Interest, or None if none chosen."""
+    v = st.session_state.get("focus_unitid")
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+def _focus_name() -> str:
+    """Name of the chosen College of Interest, or '' if none chosen."""
+    return str(st.session_state.get("focus_name") or "")
 SECTOR_COLORS = {
     "Public 4-year+":      "#2563EB",  "Private NP 4-year+":  "#059669",
     "Private FP 4-year+":  "#D97706",  "Public 2-year":       "#60A5FA",
@@ -554,21 +572,6 @@ def load_trends() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
-def load_cohort() -> dict[str, list[int]]:
-    """Return {group_name: [UNITID, ...]} from grouping.csv, or {} if file missing."""
-    if not os.path.exists(COHORT_PATH):
-        return {}
-    cdf = pd.read_csv(COHORT_PATH)
-    cdf.columns = [c.strip() for c in cdf.columns]
-    grp_col = "Attribute"
-    uid_col = "UNITID"
-    result = {}
-    for grp, sub in cdf.groupby(grp_col):
-        result[str(grp).strip()] = sorted(sub[uid_col].dropna().astype(int).unique().tolist())
-    return result
-
-
 def fmt(val, style="number", na="N/A"):
     if pd.isna(val):
         return na
@@ -602,22 +605,12 @@ def yesno(val) -> str:
 
 
 # ── Sidebar filters ──────────────────────────────────────────────────────────
-def apply_filters(df: pd.DataFrame, cohort_groups: dict) -> tuple:
-    """Return (filtered_df, selected_group_names)."""
+def apply_filters(df: pd.DataFrame) -> tuple:
+    """Return (filtered_df, selected_group_names). Group names are always empty now —
+    the inherited grouping.csv cohorts are no longer surfaced anywhere in the app."""
     st.sidebar.header("Filters")
 
     sel_groups: list[str] = []
-    # ── Cohort / peer groups (from grouping.csv) ──────────────────────────
-    if cohort_groups:
-        st.sidebar.subheader("Cohort Groups")
-        group_names = sorted(cohort_groups.keys())
-        sel_groups = st.sidebar.multiselect("Select cohort group(s)", group_names)
-        if sel_groups:
-            allowed_uids = set()
-            for g in sel_groups:
-                allowed_uids.update(cohort_groups[g])
-            df = df[df["UNITID"].isin(allowed_uids)]
-            st.sidebar.caption(f"Cohort filter: **{len(allowed_uids)}** institutions across selected group(s).")
 
     st.sidebar.subheader("General Filters")
     active_only = st.sidebar.checkbox("Active institutions only", value=True)
@@ -669,11 +662,13 @@ def apply_filters(df: pd.DataFrame, cohort_groups: dict) -> tuple:
 
 
 def _inst_table(df_tbl: pd.DataFrame, sort_col: str, ascending: bool = False, height: int = 520):
-    """Render an institution table; Albion College row highlighted in vivid amber."""
+    """Render an institution table; the focus institution's row highlighted in vivid amber."""
     tbl = (df_tbl
            .sort_values(sort_col, ascending=ascending, na_position="last")
            .reset_index(drop=True))
-    albion_idx = set(tbl.index[tbl.iloc[:, 0].astype(str).str.contains("Albion College", na=False)])
+    _fname = _focus_name()
+    albion_idx = (set(tbl.index[tbl.iloc[:, 0].astype(str).str.contains(_fname, na=False, regex=False)])
+                  if _fname else set())
     def _style_row(r):
         if r.name in albion_idx:
             return ["background-color:#FDE68A;color:#78350F;font-weight:bold"] * len(r)
@@ -684,10 +679,12 @@ def _inst_table(df_tbl: pd.DataFrame, sort_col: str, ascending: bool = False, he
     )
 
 
-def _add_albion_vline(fig, alb_row, col: str, label: str = "◆ Albion"):
-    """Add an amber dotted vertical reference line at Albion's value for a given metric column."""
+def _add_albion_vline(fig, alb_row, col: str, label=None):
+    """Add an amber dotted vertical reference line at the focus institution's value."""
     if alb_row is None:
         return
+    if label is None:
+        label = f"◆ {_focus_name()}"
     val = alb_row.get(col) if isinstance(alb_row, dict) else getattr(alb_row, col, None)
     try:
         val = float(val)
@@ -765,7 +762,7 @@ def page_overview(df: pd.DataFrame, sel_groups: list | None = None, year: str = 
         st.markdown("<div style='padding-top:1.1rem'></div>", unsafe_allow_html=True)
         st.radio("Data Year", ["2024-25", "2023-24", "2022-23"], horizontal=True,
                  key="year_National Overview", label_visibility="collapsed")
-    _alb = df[df["INSTNM"].str.contains("Albion College", case=False, na=False)]
+    _alb = df[df["UNITID"] == _focus_uid()]
     alb_row = _alb.iloc[0] if not _alb.empty else None
 
     total    = len(df)
@@ -992,13 +989,15 @@ def page_overview(df: pd.DataFrame, sel_groups: list | None = None, year: str = 
                 hoverinfo="skip", showlegend=False, name="",
             ))
 
-            # Albion College star marker
+            # Focus institution star marker
             if alb_row is not None:
                 try:
                     _alat = float(alb_row.get("LATITUDE"))
                     _alon = float(alb_row.get("LONGITUD"))
                     _alb_gr  = alb_row.get("GRRTTOT")
                     _alb_enr = alb_row.get("ENRTOT")
+                    _fname = _focus_name()
+                    _floc  = str(alb_row.get("STABBR") or "")
                     _alb_gr_str  = f"{float(_alb_gr):.1f}%"  if pd.notna(_alb_gr)  else "N/A"
                     _alb_enr_str = f"{int(float(_alb_enr)):,}" if pd.notna(_alb_enr) else "N/A"
                     if pd.notna(_alat) and pd.notna(_alon):
@@ -1006,12 +1005,12 @@ def page_overview(df: pd.DataFrame, sel_groups: list | None = None, year: str = 
                             lat=[_alat], lon=[_alon],
                             mode="markers+text",
                             marker=dict(size=24, color="#F59E0B", opacity=1),
-                            text=["★ Albion College"],
+                            text=[f"★ {_fname}"],
                             textposition="top right",
                             textfont=dict(size=13, color="#1E3A5F", family="Arial Black"),
-                            name="★ Albion College",
+                            name=f"★ {_fname}",
                             hovertemplate=(
-                                f"<b>★ Albion College</b><br>Albion, MI<br>"
+                                f"<b>★ {_fname}</b><br>{_floc}<br>"
                                 f"Grad Rate: {_alb_gr_str}<br>"
                                 f"Enrollment: {_alb_enr_str}<br>"
                                 "<extra></extra>"
@@ -2038,7 +2037,8 @@ def _scatter_explorer(df: pd.DataFrame):
             )
             fig = px.scatter(sc_df, **scatter_kwargs)
 
-            albion = sc_df[sc_df["INSTNM"].str.contains("Albion College", case=False, na=False)]
+            _fname = _focus_name()
+            albion = sc_df[sc_df["UNITID"] == _focus_uid()]
             if not albion.empty:
                 ar = albion.iloc[0]
                 fig.add_trace(go.Scatter(
@@ -2046,12 +2046,12 @@ def _scatter_explorer(df: pd.DataFrame):
                     mode="markers+text",
                     marker=dict(symbol="star", size=26, color="#F59E0B",
                                 line=dict(color="#1E3A5F", width=2.5)),
-                    text=["Albion College"],
+                    text=[_fname],
                     textposition="top right",
                     textfont=dict(size=12, color="#1E3A5F", family="Arial Black"),
-                    name="Albion College",
+                    name=_fname,
                     hovertemplate=(
-                        f"<b>Albion College</b><br>{x_var}: %{{x:.1f}}<br>{y_var}: %{{y:.1f}}<extra></extra>"
+                        f"<b>{_fname}</b><br>{x_var}: %{{x:.1f}}<br>{y_var}: %{{y:.1f}}<extra></extra>"
                     ),
                     showlegend=True,
                 ))
@@ -2059,8 +2059,9 @@ def _scatter_explorer(df: pd.DataFrame):
             fig.update_layout(height=560, legend=dict(title="Control"))
             st.plotly_chart(fig, use_container_width=True)
             st.caption(f"n = **{len(sc_df):,}** institutions with data for all three variables.")
-            _scatter_albion_insight(sc_df, albion, x_col, y_col, z_col,
-                                    x_var, y_var, z_var, chart_idx)
+            if _focus_uid() == ALBION_UNITID:
+                _scatter_albion_insight(sc_df, albion, x_col, y_col, z_col,
+                                        x_var, y_var, z_var, chart_idx)
 
 
 # ── Page 2: Institution Profile ──────────────────────────────────────────────
@@ -2201,7 +2202,7 @@ def page_profile(df: pd.DataFrame, year: str = "2024-25"):
                     "Land-grant":         yesno(row.get("LANDGRNT")),
                     "UNITID":             uid,
                 }
-                st.table(pd.DataFrame.from_dict(info, orient="index", columns=["Value"]))
+                st.table(pd.DataFrame.from_dict(info, orient="index", columns=["Value"]).astype(str))
 
             with c2:
                 st.subheader("Key Indicators")
@@ -2217,7 +2218,7 @@ def page_profile(df: pd.DataFrame, year: str = "2024-25"):
                     "% Exclusively Distance Ed": fmt(row.get("PCTDEEXC"),        "pct"),
                     "% Receiving Any Aid":       fmt(row.get("ANYAIDP"),         "pct"),
                 }
-                st.table(pd.DataFrame.from_dict(ind, orient="index", columns=["Value"]))
+                st.table(pd.DataFrame.from_dict(ind, orient="index", columns=["Value"]).astype(str))
 
             # IC{yr} educational offerings
             try:
@@ -4118,60 +4119,11 @@ def page_profile(df: pd.DataFrame, year: str = "2024-25"):
 
 
 # ── Page 3: Compare Institutions ─────────────────────────────────────────────
-def page_compare(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
-    h_col, y_col = st.columns([7, 3])
-    with h_col:
-        st.title("Compare Institutions")
-    with y_col:
-        st.markdown("<div style='padding-top:1.1rem'></div>", unsafe_allow_html=True)
-        st.radio("Data Year", ["2024-25", "2023-24", "2022-23"], horizontal=True,
-                 key="year_Compare Institutions", label_visibility="collapsed")
+def _render_comparison(cmp: pd.DataFrame, year: str = "2024-25"):
+    """Side-by-side comparison (table + bar charts + scatter) for a set of institutions.
 
-    names = sorted(df["DISPLAY_NAME"].dropna().unique())
-
-    # ── Auto-load BS&BC 30 on first visit ─────────────────────────────────────
-    _BSBC30 = "6 - BS&BC 30 Institutions"
-    if not st.session_state.get("_cmp_initialized"):
-        _default_uids = set(cohort_groups.get(_BSBC30, []))
-        _default_names = (
-            df[df["UNITID"].isin(_default_uids)]["DISPLAY_NAME"]
-            .dropna().sort_values().tolist()
-        ) if _default_uids else []
-        st.session_state["cmp_multisel"] = _default_names
-        st.session_state["_cmp_initialized"] = True
-
-    # ── Cohort quick-load ─────────────────────────────────────────────────────
-    if cohort_groups:
-        with st.expander("Load a cohort group", expanded=False):
-            grp_options = ["— select a group —"] + sorted(cohort_groups.keys())
-            # Pre-select BS&BC 30 in the dropdown so it matches the default
-            _bsbc_idx = grp_options.index(_BSBC30) if _BSBC30 in grp_options else 0
-            sel_grp = st.selectbox(
-                "Cohort group", grp_options, index=_bsbc_idx, key="cmp_grp_sel"
-            )
-            if sel_grp != "— select a group —":
-                uid_set = set(cohort_groups[sel_grp])
-                preload = (
-                    df[df["UNITID"].isin(uid_set)]["DISPLAY_NAME"]
-                    .dropna().sort_values().tolist()
-                )
-                st.caption(f"{len(preload)} institutions in this group found in the current filter.")
-                if st.button(f"Load all {len(preload)} into comparison", key="cmp_load_btn"):
-                    st.session_state["cmp_multisel"] = preload
-                    st.rerun()
-
-    selected = st.multiselect(
-        "Select institutions to compare (2–40) — type a name to search or load a cohort group above",
-        options=names, max_selections=40,
-        key="cmp_multisel",
-    )
-
-    if len(selected) < 2:
-        st.info("Select at least 2 institutions to compare.")
-        return
-
-    cmp = df[df["DISPLAY_NAME"].isin(selected)].copy()
-
+    The focus institution (Institution of Interest) is highlighted throughout.
+    """
     metrics = {
         "Total Enrollment":      ("ENRTOT",          "int"),
         "FTE Enrollment":        ("FTE",              "int"),
@@ -4213,7 +4165,7 @@ def page_compare(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
         tbl_rows.append(row_d)
 
     cmp_tbl = pd.DataFrame(tbl_rows).set_index("Metric")
-    _alb_col = next((c for c in cmp_tbl.columns if "Albion College" in c), None)
+    _alb_col = next((c for c in cmp_tbl.columns if c == _focus_name()), None)
 
     def _highlight_alb_col(df):
         styles = pd.DataFrame("", index=df.index, columns=df.columns)
@@ -4241,8 +4193,8 @@ def page_compare(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
     ]
 
     # For large sets (>10) switch from vertical bars to horizontal for readability
-    many = len(selected) > 10
-    chart_h = max(380, len(selected) * 28) if many else 360
+    many = len(cmp) > 10
+    chart_h = max(380, len(cmp) * 28) if many else 360
 
     st.subheader("Charts")
     for i in range(0, len(chart_defs), 2):
@@ -4251,9 +4203,10 @@ def page_compare(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
             with cols[j]:
                 cdf = cmp[["INSTNM", col]].dropna().sort_values(col, ascending=False)
                 if not cdf.empty:
-                    # Color: amber for Albion, steel-blue for everyone else
+                    # Color: amber for the focus institution, steel-blue for everyone else
+                    _fname = _focus_name()
                     _cmap = {
-                        n: ("#F59E0B" if "Albion College" in str(n) else "#5B9BD5")
+                        n: ("#F59E0B" if str(n) == _fname else "#5B9BD5")
                         for n in cdf["INSTNM"]
                     }
                     if many:
@@ -4267,9 +4220,9 @@ def page_compare(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
                                      color="INSTNM", color_discrete_map=_cmap,
                                      title=lbl, labels={"INSTNM": "", col: lbl})
                         fig.update_layout(showlegend=False, height=360, xaxis_tickangle=-20)
-                    # Bold amber outline on the Albion bar
+                    # Bold amber outline on the focus institution's bar
                     for trace in fig.data:
-                        if "Albion College" in str(getattr(trace, "name", "")):
+                        if str(getattr(trace, "name", "")) == _fname:
                             trace.marker.line = dict(color="#92400E", width=2.5)
                     if fmt_sym == "$":
                         if many:
@@ -4313,7 +4266,8 @@ def page_compare(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
                 title=f"{x_var}  ×  {y_var}  (bubble = {z_var})",
             )
 
-            albion_c = csc_df[csc_df["INSTNM"].str.contains("Albion College", case=False, na=False)]
+            _fname = _focus_name()
+            albion_c = csc_df[csc_df["UNITID"] == _focus_uid()]
             if not albion_c.empty:
                 ar = albion_c.iloc[0]
                 fig.add_trace(go.Scatter(
@@ -4321,116 +4275,23 @@ def page_compare(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
                     mode="markers+text",
                     marker=dict(symbol="star", size=28, color="#F59E0B",
                                 line=dict(color="#1E3A5F", width=2.5)),
-                    text=["Albion College"],
+                    text=[_fname],
                     textposition="top right",
                     textfont=dict(size=12, color="#1E3A5F", family="Arial Black"),
-                    name="Albion College ★",
+                    name=f"{_fname} ★",
                     hovertemplate=(
-                        f"<b>Albion College</b><br>{x_var}: %{{x:.1f}}<br>{y_var}: %{{y:.1f}}<extra></extra>"
+                        f"<b>{_fname}</b><br>{x_var}: %{{x:.1f}}<br>{y_var}: %{{y:.1f}}<extra></extra>"
                     ),
                     showlegend=True,
                 ))
 
             fig.update_layout(height=520, legend=dict(title="Institution"))
             st.plotly_chart(fig, use_container_width=True)
-            st.caption(f"n = **{len(csc_df)}** of {len(selected)} selected institutions have data for all three variables.")
-
-
-# ── Page 4: Albion College Analysis ─────────────────────────────────────────
-def _albion_trends_tab(alb_current, peers_current, peer_label: str, cohort_groups: dict, sel: str):
-    """Standalone Albion trends tab called from page_albion (not page_trends)."""
-    st.subheader(f"Albion College — Year-over-Year vs. {peer_label}")
-    st.caption("Compares all available IPEDS years in METRICS_LONG.")
-
-    trend_df = load_trends()
-    alb_trend = trend_df[trend_df["INSTNM"].str.contains("Albion College", case=False, na=False)].sort_values("YEAR")
-
-    if alb_trend.empty:
-        st.warning("Albion College trend data not found in METRICS_LONG.")
-        return
-
-    BUILTIN_AT = {
-        "All Private Non-Profit (national)": "builtin_np",
-        "Small Private NP — under 5,000 students": "builtin_size",
-    }
-    if sel in BUILTIN_AT:
-        peer_trend = (trend_df[trend_df["CONTROL"] == 2] if BUILTIN_AT[sel] == "builtin_np"
-                      else trend_df[(trend_df["CONTROL"] == 2) & (trend_df["INSTSIZE"].isin([1, 2]))])
-    else:
-        peer_trend = trend_df[trend_df["UNITID"].isin(cohort_groups.get(sel, []))]
-    peer_trend = peer_trend[~peer_trend["INSTNM"].str.contains("Albion College", case=False, na=False)]
-
-    _AT_METRICS = [
-        ("Grad Rate 150% (%)",    "GRRTTOT",      True,  "{:.1f}%"),
-        ("FT Retention Rate (%)", "RET_PCF",       True,  "{:.1f}%"),
-        ("Acceptance Rate (%)",   "DVADM01",       False, "{:.1f}%"),
-        ("% Receiving Pell",      "PGRNT_P",       True,  "{:.1f}%"),
-        ("In-State COA ($)",      "CINSON",        False, "${:,.0f}"),
-        ("Avg Faculty Salary ($)","SALTOTL",       True,  "${:,.0f}"),
-        ("Total Enrollment",      "ENRTOT",        True,  "{:,.0f}"),
-        ("8-yr Award Rate (%)",   "OM1TOTLAWDP8",  True,  "{:.1f}%"),
-        ("Student:Faculty Ratio", "STUFACR",       False, "{:.1f}"),
-    ]
-
-    _avail_yrs = sorted(alb_trend["YEAR"].unique())
-    _yr_last   = _avail_yrs[-1] if _avail_yrs else "2024-25"
-    _yr_prev   = _avail_yrs[-2] if len(_avail_yrs) >= 2 else None
-
-    tbl_rows = []
-    for lbl, col, _, fmt_str in _AT_METRICS:
-        row = {"Metric": lbl}
-        for yr in _avail_yrs:
-            av = alb_trend[alb_trend["YEAR"] == yr][col].values
-            pv = peer_trend[peer_trend["YEAR"] == yr][col].dropna()
-            row[f"Albion {yr}"] = fmt_str.format(float(av[0])) if len(av) and pd.notna(av[0]) else "—"
-            row[f"Peers {yr}"]  = fmt_str.format(float(pv.median())) if not pv.empty else "—"
-        try:
-            if _yr_prev:
-                row["Albion Δ"] = f"{float(alb_trend[alb_trend['YEAR']==_yr_last][col].values[0]) - float(alb_trend[alb_trend['YEAR']==_yr_prev][col].values[0]):+.1f}"
-            else:
-                row["Albion Δ"] = "—"
-        except Exception:
-            row["Albion Δ"] = "—"
-        tbl_rows.append(row)
-    st.dataframe(pd.DataFrame(tbl_rows).set_index("Metric"), use_container_width=True)
-
-    st.divider()
-    st.subheader(f"Trend Charts — Albion vs. Peer Median ({peer_label})")
-    _years = _avail_yrs
-    _chart_m = [m for m in _AT_METRICS if m[1] in ["GRRTTOT","RET_PCF","ENRTOT","CINSON","SALTOTL","PGRNT_P"]]
-    _cols = st.columns(2)
-    for i, (lbl, col, _, fmt_str) in enumerate(_chart_m):
-        alb_pts = [float(v[0]) if len(v:=alb_trend[alb_trend["YEAR"]==yr][col].values) and pd.notna(v[0]) else None for yr in _years]
-        prs_pts = [float(s.median()) if not (s:=peer_trend[peer_trend["YEAR"]==yr][col].dropna()).empty else None for yr in _years]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=_years, y=prs_pts, mode="lines+markers",
-            name=f"Peer Median ({peer_label})", line=dict(color="#6B7280", width=2, dash="dash"), marker=dict(size=8)))
-        fig.add_trace(go.Scatter(x=_years, y=alb_pts, mode="lines+markers+text",
-            name="Albion College", line=dict(color="#F59E0B", width=3),
-            marker=dict(size=12, symbol="star", color="#F59E0B", line=dict(color="#92400E", width=2)),
-            text=[fmt_str.format(v) if v is not None else "" for v in alb_pts], textposition="top center"))
-        fig.update_layout(title=lbl, height=300, legend=dict(orientation="h", y=-0.25),
-                          margin=dict(l=0, r=0, t=40, b=0), yaxis_title=lbl)
-        _cols[i % 2].plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-    st.subheader(f"Each Peer Institution — {peer_label}")
-    _uids = peer_trend["UNITID"].dropna().unique().tolist()
-    if len(_uids) == 0:
-        st.info("No peer institutions found.")
-    elif len(_uids) > 100:
-        st.info(f"{len(_uids):,} institutions — select a specific cohort group to see per-institution breakdowns.")
-    else:
-        st.caption(f"{len(_uids)} institutions — expand any to see its year-over-year metrics.")
-        _name_uid = sorted([(str(peer_trend[peer_trend["UNITID"]==u]["INSTNM"].iloc[0]), u)
-                            for u in _uids if not peer_trend[peer_trend["UNITID"]==u].empty])
-        for name, uid in _name_uid:
-            with st.expander(name, expanded=("Albion College" in name)):
-                _render_inst_pivot(peer_trend[peer_trend["UNITID"]==uid].sort_values("YEAR"))
+            st.caption(f"n = **{len(csc_df)}** of {len(cmp)} institutions have data for all three variables.")
 
 
 # ── Page 5: Year-over-Year Trends ────────────────────────────────────────────
-def page_trends(cohort_groups: dict):
+def page_trends():
     trend_df = load_trends()
     YEARS = sorted(trend_df["YEAR"].unique().tolist())
 
@@ -4447,24 +4308,11 @@ def page_trends(cohort_groups: dict):
         ("8-yr Award Rate (%)",   "OM1TOTLAWDP8",  "{:.1f}%"),
         ("Student:Faculty Ratio", "STUFACR",       "{:.1f}"),
     ]
-    SHORT = {
-        "Grad Rate 150% (%)":     "GR150%",
-        "FT Retention Rate (%)":  "Retention",
-        "Acceptance Rate (%)":    "Accept%",
-        "% Receiving Pell":       "Pell%",
-        "In-State COA ($)":       "COA",
-        "Avg Faculty Salary ($)": "FacSalary",
-        "Total Enrollment":       "Enrollment",
-        "8-yr Award Rate (%)":    "Award8yr",
-        "Student:Faculty Ratio":  "SFRatio",
-    }
-    BUILTIN = {
-        "All Private Non-Profit (national)": "builtin_np",
-        "Small Private NP — under 5,000 students": "builtin_size",
-    }
 
     # ── TABS ──────────────────────────────────────────────────────────────────
-    t1, t2 = st.tabs(["📊 National Trends", "🎓 Albion College Trends"])
+    _foc_uid  = _focus_uid()
+    _foc_name = _focus_name() or "Institution of Interest"
+    t1, t2 = st.tabs(["📊 National Trends", f"🎓 {_foc_name} Trends"])
 
     # ════════════════════════════════════════════════════════════════════════
     # TAB 1 — National Trends
@@ -4534,211 +4382,240 @@ def page_trends(cohort_groups: dict):
         st.subheader("Institution Lookup")
         st.caption(f"Search any institution to see its {YEARS[0]} → {YEARS[-1]} metrics.")
         all_names = sorted(trend_df["INSTNM"].dropna().unique())
-        sch = st.selectbox("Search institution", ["— select —"] + all_names, key="yt_inst_search")
+        _lk_typed = st.text_input(
+            "Type to narrow the list", key="yt_inst_filter",
+            placeholder="Type a name to narrow…",
+        )
+        _lk_filt = [n for n in all_names if _lk_typed.lower() in n.lower()] if _lk_typed else all_names
+        if not _lk_filt:
+            st.warning("No institution matches that search.")
+            _lk_filt = all_names
+        sch = st.selectbox("Search institution", ["— select —"] + _lk_filt, key="yt_inst_search")
         if sch and sch != "— select —":
             _render_inst_pivot(trend_df[trend_df["INSTNM"] == sch].sort_values("YEAR"))
 
     # ════════════════════════════════════════════════════════════════════════
-    # TAB 2 — Albion College Trends
+    # TAB 2 — Institution of Interest Trends (focus vs. national & control medians)
     # ════════════════════════════════════════════════════════════════════════
     with t2:
-        # ── Peer group selector (Albion tab only) ─────────────────────────────
-        sel_grp = st.selectbox(
-            "Select cohort / peer group",
-            list(BUILTIN.keys()) + sorted(cohort_groups.keys()),
-            index=list(BUILTIN.keys()).index("All Private Non-Profit (national)"),
-            key="yt_grp",
-            help="Used as peer benchmark for Albion comparisons.",
-        )
-
-        _builtin_selected = sel_grp in BUILTIN
-        if not _builtin_selected:
-            _pool = cohort_groups.get(sel_grp, [])
-            _school_rows = (
-                trend_df[trend_df["UNITID"].isin(_pool)][["UNITID", "INSTNM"]]
-                .drop_duplicates("UNITID").dropna(subset=["INSTNM"])
-                .sort_values("INSTNM")
-            )
-            _school_rows = _school_rows[
-                ~_school_rows["INSTNM"].str.contains("Albion College", case=False, na=False)
-            ]
-            _uid_by_name  = {str(r["INSTNM"]): int(r["UNITID"]) for _, r in _school_rows.iterrows()}
-            _school_names = list(_uid_by_name.keys())
+        if not _foc_uid:
+            st.info("👈 Pick an **Institution of Interest** in the sidebar to see its "
+                    "year-over-year trends versus the national and same-control medians.")
         else:
-            _uid_by_name  = {}
-            _school_names = []
+            foc_df = trend_df[trend_df["UNITID"] == _foc_uid].sort_values("YEAR")
+            if foc_df.empty:
+                st.warning(f"{_foc_name} was not found in the multi-year trend data (METRICS_LONG).")
+            else:
+                _ctrl_lbl  = str(foc_df.iloc[-1].get("CONTROL_LBL") or "")
+                _t2_newest = YEARS[-1]
+                _t2_prev   = YEARS[-2] if len(YEARS) >= 2 else None
+                st.subheader(f"{_foc_name} — {YEARS[0]} → {_t2_newest}")
+                st.caption("Each metric shown per year, with the latest-year change in the Δ column. "
+                           f"Charts compare {_foc_name} to the national median"
+                           + (f" and the {_ctrl_lbl} median." if _ctrl_lbl else "."))
 
-        if not _builtin_selected:
-            sel_school = st.selectbox(
-                "Or compare Albion 1-on-1 vs. one school from this cohort:",
-                ["— use group median —"] + _school_names,
-                key="yt_school",
-            )
-        else:
-            sel_school = "— use group median —"
-        use_single = sel_school != "— use group median —"
+                # Change table — the focus institution's own values per year + Δ
+                tbl_rows = []
+                for lbl, col, fmt_str in METRICS:
+                    row = {"Metric": lbl}
+                    for yr in YEARS:
+                        fv = foc_df[foc_df["YEAR"] == yr][col].values
+                        row[str(yr)] = fmt_str.format(float(fv[0])) if len(fv) and pd.notna(fv[0]) else "—"
+                    try:
+                        if _t2_prev:
+                            _a = float(foc_df[foc_df["YEAR"] == _t2_newest][col].values[0])
+                            _b = float(foc_df[foc_df["YEAR"] == _t2_prev][col].values[0])
+                            row["Δ (latest)"] = f"{_a - _b:+.1f}"
+                        else:
+                            row["Δ (latest)"] = "—"
+                    except Exception:
+                        row["Δ (latest)"] = "—"
+                    tbl_rows.append(row)
+                st.dataframe(pd.DataFrame(tbl_rows).set_index("Metric"), use_container_width=True)
 
-        # Albion rows
-        alb_df = trend_df[trend_df["INSTNM"].str.contains("Albion College", case=False, na=False)].sort_values("YEAR")
-
-        if alb_df.empty:
-            st.warning("Albion College not found in METRICS_LONG.")
-            return
-
-        # Peer rows
-        if use_single:
-            _sel_uid = _uid_by_name[sel_school]
-            peer_df  = trend_df[trend_df["UNITID"] == _sel_uid]
-            peer_label    = sel_school
-            peer_line_name = sel_school
-        elif BUILTIN.get(sel_grp) == "builtin_np":
-            peer_df  = trend_df[trend_df["CONTROL"] == 2]
-            peer_label    = sel_grp
-            peer_line_name = "Peer Median"
-        elif BUILTIN.get(sel_grp) == "builtin_size":
-            peer_df  = trend_df[(trend_df["CONTROL"] == 2) & (trend_df["INSTSIZE"].isin([1, 2]))]
-            peer_label    = sel_grp
-            peer_line_name = "Peer Median"
-        else:
-            peer_df  = trend_df[trend_df["UNITID"].isin(cohort_groups.get(sel_grp, []))]
-            peer_label    = sel_grp
-            peer_line_name = "Peer Median"
-        peer_df = peer_df[~peer_df["INSTNM"].str.contains("Albion College", case=False, na=False)]
-
-        _t2_newest = YEARS[-1]
-        _t2_prev   = YEARS[-2] if len(YEARS) >= 2 else None
-        st.subheader(f"Albion College — {YEARS[0]} → {_t2_newest}  vs.  {peer_label}")
-        st.caption(f"{'1-on-1 comparison' if use_single else 'Peer median comparison'} · "
-                   f"{_t2_prev} → {_t2_newest} change shown in Δ column")
-
-        # Change table
-        tbl_rows = []
-        peer_col = peer_label if use_single else "Peers"
-        for lbl, col, fmt_str in METRICS:
-            row = {"Metric": lbl}
-            for yr in YEARS:
-                av = alb_df[alb_df["YEAR"]==yr][col].values
-                pv = peer_df[peer_df["YEAR"]==yr][col].dropna()
-                row[f"Albion {yr}"] = fmt_str.format(float(av[0])) if len(av) and pd.notna(av[0]) else "—"
-                row[f"{peer_col} {yr}"] = fmt_str.format(float(pv.median())) if not pv.empty else "—"
-            try:
-                if _t2_prev:
-                    row["Albion Δ"] = f"{float(alb_df[alb_df['YEAR']==_t2_newest][col].values[0]) - float(alb_df[alb_df['YEAR']==_t2_prev][col].values[0]):+.1f}"
-                else:
-                    row["Albion Δ"] = "—"
-            except Exception:
-                row["Albion Δ"] = "—"
-            tbl_rows.append(row)
-        st.dataframe(pd.DataFrame(tbl_rows).set_index("Metric"), use_container_width=True)
-
-        # Line charts
-        st.divider()
-        st.subheader(f"Trend Charts — Albion vs. {peer_line_name}")
-        chart_m = [(l,c,f) for l,c,f in METRICS if c in ["GRRTTOT","RET_PCF","ENRTOT","CINSON","SALTOTL","PGRNT_P"]]
-        ccols = st.columns(2)
-        for i, (lbl, col, fmt_str) in enumerate(chart_m):
-            alb_pts = [float(v[0]) if len(v:=alb_df[alb_df["YEAR"]==yr][col].values) and pd.notna(v[0]) else None for yr in YEARS]
-            prs_pts = [float(s.median()) if not (s:=peer_df[peer_df["YEAR"]==yr][col].dropna()).empty else None for yr in YEARS]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=YEARS, y=prs_pts, mode="lines+markers",
-                name=peer_line_name if use_single else f"{peer_line_name} ({peer_label})",
-                line=dict(color="#6B7280", width=2, dash="dash"), marker=dict(size=8),
-            ))
-            fig.add_trace(go.Scatter(
-                x=YEARS, y=alb_pts, mode="lines+markers+text",
-                name="Albion College",
-                line=dict(color="#F59E0B", width=3),
-                marker=dict(size=12, symbol="star", color="#F59E0B", line=dict(color="#92400E", width=2)),
-                text=[fmt_str.format(v) if v is not None else "" for v in alb_pts],
-                textposition="top center",
-            ))
-            fig.update_layout(title=lbl, height=300, legend=dict(orientation="h", y=-0.25),
-                              margin=dict(l=0, r=0, t=40, b=0), yaxis_title=lbl)
-            ccols[i % 2].plotly_chart(fig, use_container_width=True)
-
-        # Per-peer institution expanders
-        st.divider()
-        st.subheader(f"Each Peer Institution — {peer_label}")
-        peer_uids = peer_df["UNITID"].dropna().unique().tolist()
-        if len(peer_uids) == 0:
-            st.info("No peer institutions found.")
-        elif len(peer_uids) > 100:
-            st.info(f"{len(peer_uids):,} institutions — select a specific cohort group to see per-institution breakdowns.")
-        else:
-            st.caption(f"{len(peer_uids)} institutions — expand any to see its year-over-year metrics.")
-            sorted_peers = sorted(
-                [(str(peer_df[peer_df["UNITID"]==u]["INSTNM"].iloc[0]), u)
-                 for u in peer_uids if not peer_df[peer_df["UNITID"]==u].empty]
-            )
-            for name, uid in sorted_peers:
-                with st.expander(name, expanded=False):
-                    _render_inst_pivot(peer_df[peer_df["UNITID"]==uid].sort_values("YEAR"))
+                # Line charts — focus vs national median vs same-control median
+                st.divider()
+                st.subheader(f"Trend Charts — {_foc_name} vs. Medians")
+                chart_m = [(l, c, f) for l, c, f in METRICS
+                           if c in ["GRRTTOT", "RET_PCF", "ENRTOT", "CINSON", "SALTOTL", "PGRNT_P"]]
+                ccols = st.columns(2)
+                for i, (lbl, col, fmt_str) in enumerate(chart_m):
+                    foc_pts  = [float(v[0]) if len(v := foc_df[foc_df["YEAR"] == yr][col].values) and pd.notna(v[0]) else None
+                                for yr in YEARS]
+                    nat_pts  = [float(s.median()) if not (s := trend_df[trend_df["YEAR"] == yr][col].dropna()).empty else None
+                                for yr in YEARS]
+                    ctrl_pts = [float(s.median()) if _ctrl_lbl and not (
+                                    s := trend_df[(trend_df["YEAR"] == yr) & (trend_df["CONTROL_LBL"] == _ctrl_lbl)][col].dropna()
+                                ).empty else None for yr in YEARS]
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=YEARS, y=nat_pts, mode="lines+markers", name="National median",
+                        line=dict(color="#6B7280", width=2, dash="dash"), marker=dict(size=8),
+                    ))
+                    if _ctrl_lbl:
+                        fig.add_trace(go.Scatter(
+                            x=YEARS, y=ctrl_pts, mode="lines+markers", name=f"{_ctrl_lbl} median",
+                            line=dict(color="#2563EB", width=2, dash="dot"), marker=dict(size=7),
+                        ))
+                    fig.add_trace(go.Scatter(
+                        x=YEARS, y=foc_pts, mode="lines+markers+text", name=_foc_name,
+                        line=dict(color="#F59E0B", width=3),
+                        marker=dict(size=12, symbol="star", color="#F59E0B", line=dict(color="#92400E", width=2)),
+                        text=[fmt_str.format(v) if v is not None else "" for v in foc_pts],
+                        textposition="top center",
+                    ))
+                    fig.update_layout(title=lbl, height=300, legend=dict(orientation="h", y=-0.25),
+                                      margin=dict(l=0, r=0, t=40, b=0), yaxis_title=lbl)
+                    ccols[i % 2].plotly_chart(fig, use_container_width=True)
 
 
-def page_albion(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
+# ══════════════════════════════════════════════════════════════════════════════
+#  Strategic Analysis — generic, works for ANY chosen College of Interest
+# ══════════════════════════════════════════════════════════════════════════════
+_ACCENT_LINE = "#D97706"
+_ACCENT_STAR = "#F59E0B"
+_ACCENT_TEXT = "#92400E"
+_ACCENT_BG   = "rgba(253,230,138,0.92)"
+
+
+def recommend_peers(df: pd.DataFrame, focus_uid: int, focus: pd.Series, k: int = 15) -> list:
+    """Return DISPLAY_NAMEs of the k institutions most similar to the focus.
+
+    Similarity = same control & level, then nearest on standardized enrollment,
+    cost of attendance, 6-yr grad rate and faculty salary (whichever are present),
+    with a small bonus for matching sector. A sensible starting comparison set
+    that the user is free to edit.
+    """
+    cand = df[df["UNITID"] != focus_uid].copy()
+    if pd.notna(focus.get("CONTROL")):
+        cand = cand[cand["CONTROL"] == focus.get("CONTROL")]
+    if "ICLEVEL" in cand.columns and pd.notna(focus.get("ICLEVEL")):
+        cand = cand[cand["ICLEVEL"] == focus.get("ICLEVEL")]
+    if cand.empty:
+        return []
+
+    dist = pd.Series(0.0, index=cand.index)
+    used = 0
+    for col in ["ENRTOT", "CINSON", "GBA6RTT", "SALTOTL"]:
+        if col not in cand.columns:
+            continue
+        fv = focus.get(col)
+        if fv is None or pd.isna(fv):
+            continue
+        s  = pd.to_numeric(cand[col], errors="coerce")
+        sd = s.std(skipna=True)
+        if not sd or pd.isna(sd):
+            continue
+        d = ((s - float(fv)) / sd).abs()
+        dist = dist.add(d.fillna(d.max() if pd.notna(d.max()) else 0.0), fill_value=0.0)
+        used += 1
+    if used == 0:
+        s = pd.to_numeric(cand.get("ENRTOT"), errors="coerce")
+        base = float(focus.get("ENRTOT") or (s.median() if pd.notna(s.median()) else 0))
+        dist = (s - base).abs().fillna(s.max())
+
+    # Reward same-sector matches (smaller distance is better)
+    if "SECTOR" in cand.columns and pd.notna(focus.get("SECTOR")):
+        dist = dist - (cand["SECTOR"] == focus.get("SECTOR")).astype(float) * 0.5
+
+    cand = cand.assign(_dist=dist).sort_values("_dist")
+    return cand["DISPLAY_NAME"].dropna().head(k).tolist()
+
+
+def page_strategic(df: pd.DataFrame, focus_uid: int, focus_name: str, year: str = "2024-25"):
     h_col, y_col = st.columns([7, 3])
     with h_col:
-        st.title("Albion College — Strategic Performance Analysis")
+        st.title(f"{focus_name} — Strategic Performance Analysis")
     with y_col:
         st.markdown("<div style='padding-top:1.1rem'></div>", unsafe_allow_html=True)
         st.radio("Data Year", ["2024-25", "2023-24", "2022-23"], horizontal=True,
-                 key="year_Albion Analysis", label_visibility="collapsed")
+                 key="year_Institution of Interest Analysis", label_visibility="collapsed")
 
-    alb_all = df[df["INSTNM"].str.contains("Albion College", case=False, na=False)]
-    if alb_all.empty:
-        st.error(f"Albion College not found in the dataset. Ensure the database includes HD{year[:4]}.")
+    foc_all = df[df["UNITID"] == focus_uid]
+    if foc_all.empty:
+        st.error(f"{focus_name} not found in the {year} dataset. "
+                 f"It may not have reported in this year — try another data year.")
         return
-    alb = alb_all.iloc[0]
+    focus = foc_all.iloc[0]
 
-    # ── Peer group selector ───────────────────────────────────────────────────
-    BUILTIN = {
-        "All Private Non-Profit (national)":           "builtin_np",
-        "Small Private NP — under 5,000 students":     "builtin_size",
-    }
-    cohort_options = list(BUILTIN.keys()) + sorted(cohort_groups.keys())
-    _BSBC30 = "6 - BS&BC 30 Institutions"
-    if _BSBC30 in cohort_options:
-        default_idx = cohort_options.index(_BSBC30)
-    elif cohort_groups:
-        default_idx = len(BUILTIN)          # fall back to first cohort group
-    else:
-        default_idx = 0
+    mark = focus_name if len(focus_name) <= 22 else focus_name[:21] + "…"
 
-    sel = st.selectbox(
-        "**Compare Albion against:**",
-        cohort_options,
-        index=default_idx,
-        key="alb_peer_sel",
-        help="Choose any built-in benchmark or one of your defined cohort groups.",
+    # ── Peer set: free selection with smart recommendations ──────────────────
+    st.markdown(f"**Choose which colleges to compare {focus_name} against:**")
+    all_names = sorted(df[df["UNITID"] != focus_uid]["DISPLAY_NAME"].dropna().unique().tolist())
+    rec_names = [n for n in recommend_peers(df, focus_uid, focus, k=15) if n in all_names]
+
+    # Changing the focus institution resets the peer set to its recommendations.
+    if st.session_state.get("strat_peer_focus") != focus_uid:
+        st.session_state["strat_peer_focus"]  = focus_uid
+        st.session_state["strat_peer_multi"]  = rec_names
+        st.session_state["strat_peer_loaded"] = list(rec_names)
+        st.session_state["strat_peer_label"]  = "Recommended similar colleges"
+
+    if st.button("🎯 Load recommended similar colleges", use_container_width=True,
+                 help="Same control & level as the focus college; closest on enrollment, "
+                      "cost, graduation rate and faculty salary."):
+        st.session_state["strat_peer_multi"]  = rec_names
+        st.session_state["strat_peer_loaded"] = list(rec_names)
+        st.session_state["strat_peer_label"]  = "Recommended similar colleges"
+        st.rerun()
+
+    peer_names = st.multiselect(
+        "Peer colleges — type to search, then add or remove any institution freely",
+        options=all_names,
+        key="strat_peer_multi",
     )
 
-    if sel in BUILTIN:
-        if BUILTIN[sel] == "builtin_np":
-            peers = df[df["CONTROL"] == 2].copy()
-        else:
-            peers = df[(df["CONTROL"] == 2) & (df["INSTSIZE"].isin([1, 2]))].copy()
-        peer_label = sel
-    else:
-        uid_list = cohort_groups.get(sel, [])
-        peers = df[df["UNITID"].isin(uid_list)].copy()
-        peer_label = sel
+    with st.expander("💡 Why these recommendations?", expanded=False):
+        st.markdown(
+            f"The recommended set shares the same **control** (public / private) and **level** as "
+            f"**{focus_name}**, then picks the closest matches on **enrollment size, cost of attendance, "
+            f"6-year graduation rate, and average faculty salary** (with a nudge toward the same sector). "
+            f"It is only a starting point — add or remove any college above to build your own comparison set."
+        )
+        if rec_names:
+            st.caption("Recommended: " + ", ".join(n.split(" (")[0] for n in rec_names))
 
-    # Exclude Albion itself from the peer pool
-    peers = peers[~peers["INSTNM"].str.contains("Albion College", case=False, na=False)]
+    if len(peer_names) < 2:
+        st.warning("Select at least 2 peer colleges to build the analysis — "
+                   "click **🎯 Load recommended similar colleges** above for a quick start.")
+        return
+
+    peers = df[df["DISPLAY_NAME"].isin(peer_names) & (df["UNITID"] != focus_uid)].copy()
+
+    loaded = st.session_state.get("strat_peer_loaded")
+    if loaded is not None and set(peer_names) == set(loaded):
+        peer_label = st.session_state.get("strat_peer_label", "Selected peer set")
+    else:
+        peer_label = "Custom peer set"
 
     n_peers = len(peers)
     st.caption(
-        f"Comparing against **{n_peers:,} institutions** in: *{peer_label}*"
-        + (" — percentile rankings may be approximate with fewer than 10 peers." if n_peers < 10 else "")
+        f"Comparing **{focus_name}** against **{n_peers:,} colleges** — *{peer_label}*."
+        + (" Percentile rankings may be approximate with fewer than 10 peers." if n_peers < 10 else "")
     )
     st.divider()
 
+    focus_display = str(focus.get("DISPLAY_NAME") or focus_name)
+    tab_a, tab_c = st.tabs(["📊 Benchmark Analysis", "📋 Side-by-Side Comparison"])
+    with tab_c:
+        st.caption("Exact reported numbers for the Institution of Interest and the peers selected "
+                   "above, side by side — with bar charts and a scatter explorer.")
+        cmp = df[df["DISPLAY_NAME"].isin([focus_display] + peer_names)].copy()
+        if len(cmp) < 2:
+            st.info("Add at least one peer above to build the side-by-side comparison.")
+        else:
+            _render_comparison(cmp, year)
+    with tab_a:
+        _render_benchmark(focus, focus_name, peers, peer_label, n_peers, mark, year)
+
+
+def _render_benchmark(focus, focus_name, peers, peer_label, n_peers, mark, year):
     def _val(col):
-        v = alb.get(col)
+        v = focus.get(col)
         return None if v is None or (isinstance(v, float) and pd.isna(v)) else v
 
-    def _pct(series: pd.Series, val, higher_is_better: bool = True) -> int | None:
+    def _pct(series: pd.Series, val, higher_is_better: bool = True):
         """Percentile rank where 100 = best (regardless of direction)."""
         if val is None:
             return None
@@ -4748,7 +4625,7 @@ def page_albion(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
         below = float((clean < val).sum()) / len(clean) * 100
         return round(below if higher_is_better else 100 - below)
 
-    def _badge(pct) -> str:
+    def _badge(pct):
         if pct is None:
             return "⚪ No data"
         if pct >= 75:
@@ -4768,6 +4645,35 @@ def page_albion(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
             return "—"
         return f"{v:.{decimals}f}"
 
+    def _star(fig, x, y, xfmt, yfmt):
+        """Add the focus-institution star marker to a scatter figure.
+
+        Returns a caption string when the institution can't be plotted (so the
+        caller can explain its absence), else None.
+        """
+        if x is None or y is None:
+            return (f"ℹ️ {focus_name} isn't marked on this chart — it has no reported value "
+                    f"for one or both axes in {year}.")
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y], mode="markers+text",
+            marker=dict(symbol="star", size=28, color=_ACCENT_STAR, line=dict(color="#1E3A5F", width=2.5)),
+            text=[focus_name], textposition="top right",
+            textfont=dict(size=12, color="#1E3A5F", family="Arial Black"),
+            name=focus_name, showlegend=True,
+            hovertemplate=f"<b>{focus_name}</b><br>{xfmt}<br>{yfmt}<extra></extra>",
+        ))
+        return None
+
+    def _vline(fig, x, series):
+        """Add focus ◆ line + peer-median line to a distribution figure."""
+        fig.add_vline(x=x, line_color=_ACCENT_LINE, line_width=3, line_dash="dot",
+                      annotation_text=f"◆ {mark}", annotation_position="top right",
+                      annotation_font_color=_ACCENT_TEXT, annotation_font_size=12,
+                      annotation_bgcolor=_ACCENT_BG)
+        fig.add_vline(x=float(series.median()), line_color="#6B7280", line_width=1.5, line_dash="dash",
+                      annotation_text="Peer median", annotation_position="top left",
+                      annotation_font_color="#374151", annotation_font_size=10)
+
     # ── Snapshot metrics ──────────────────────────────────────────────────────
     st.subheader("Institution Snapshot")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -4780,6 +4686,7 @@ def page_albion(df: pd.DataFrame, cohort_groups: dict, year: str = "2024-25"):
     st.divider()
 
     # ── Performance scorecard ─────────────────────────────────────────────────
+    VAL_COL = "Value"
     st.subheader("Performance Scorecard")
     with st.expander("How to read this table", expanded=False):
         st.markdown(
@@ -4791,15 +4698,15 @@ Faculty & Staff, Library). For every metric you see three things:
 
 | Column | Meaning |
 |---|---|
-| **Albion Value** | Albion College's actual reported figure for the {year} reporting cycle |
-| **vs … (pct)** | Albion's *percentile rank* within the selected peer group — the share of peer institutions that Albion **outperforms** on this metric |
+| **{VAL_COL}** | {focus_name}'s actual reported figure for the {year} reporting cycle |
+| **vs … (pct)** | {focus_name}'s *percentile rank* within the selected peer group — the share of peer institutions it **outperforms** on this metric |
 | **Rating** | A traffic-light badge based on that percentile |
 
 **Reading the percentile**
 
-A percentile of **82** means Albion performs better than 82% of the institutions in the selected peer group on that
-metric. Percentiles are always "higher = better": for metrics where lower is better (e.g., acceptance rate, student:
-faculty ratio, cost of attendance, loan reliance) the scale is automatically flipped so that a more-selective,
+A percentile of **82** means {focus_name} performs better than 82% of the institutions in the selected peer group on
+that metric. Percentiles are always "higher = better": for metrics where lower is better (e.g., acceptance rate,
+student:faculty ratio, cost of attendance, loan reliance) the scale is automatically flipped so that a more-selective,
 cheaper, or smaller-class-size result still earns a higher number.
 
 **Rating badges**
@@ -4809,39 +4716,27 @@ cheaper, or smaller-class-size result still earns a higher number.
 | 🟢 Strength | ≥ 75th percentile | Top quarter of the peer group — a demonstrated competitive advantage |
 | 🟡 Average | 40th – 74th percentile | Performs at or near the peer median — monitor for drift |
 | 🔴 Needs attention | < 40th percentile | Bottom quarter — a priority area for strategic investment |
-| ⚪ No data | — | IPEDS did not report a value for Albion or too few peers have data |
+| ⚪ No data | — | IPEDS did not report a value, or too few peers have data |
 
 **Understanding "pp" (percentage points)**
 
-Some values are shown as **+3.5 pp** or **−10.0 pp**. "pp" stands for *percentage points* — it is the arithmetic
-difference between two percentages, not a ratio. For example, if Albion's overall graduation rate is 68% and its
-Pell graduation rate is 58%, the gap is −10.0 pp.
-
-The **Pell vs Overall Gap** metric uses this unit specifically. It measures whether Pell recipients (low-income,
-federally-aided students) graduate at the same rate as the broader student body:
-
-- A gap near **0 pp** means Albion graduates Pell and non-Pell students at roughly equal rates — strong equity.
-- A **negative** gap (e.g., −10.0 pp) means Pell students graduate at a lower rate than the overall population —
-  an equity outcome gap that warrants attention.
-- A **positive** gap (rare) means Pell students actually outperform the average — an exceptional equity outcome.
-
-The percentile rank for this metric is scored so that **a smaller gap earns a higher percentile** — meaning a
-score of 70 indicates Albion's equity gap is smaller than 70% of peer institutions.
+Some values are shown as **+3.5 pp** or **−10.0 pp**. "pp" stands for *percentage points* — the arithmetic difference
+between two percentages, not a ratio. The **Pell vs Overall Gap** metric uses this unit: it measures whether Pell
+recipients (low-income, federally-aided students) graduate at the same rate as the broader student body. A gap near
+**0 pp** signals strong equity; a **negative** gap means Pell students graduate at a lower rate. The percentile is
+scored so a smaller gap earns a higher rank.
 
 **Choosing a peer group**
 
-Use the selector above to switch between peer groups at any time. The BS&BC 30 cohort is the default because it
-represents the institutions Albion most directly competes with for students, faculty, and donors — making it the
-most actionable benchmark for strategic planning.
+Use the selector above to switch peer groups at any time, or change the Institution of Interest in the sidebar.
             """
         )
     st.caption(
-        f"Percentile = share of **{peer_label}** institutions that Albion **outperforms** on each metric "
+        f"Percentile = share of **{peer_label}** institutions that {focus_name} **outperforms** on each metric "
         f"(100 = best in group). n = {n_peers:,} peer institutions."
     )
 
     SCORECARD = [
-        # (Category, Display name, col, higher_is_better, fmt_fn)
         ("Admissions",       "Acceptance Rate",          "DVADM01", False, _fmt_pct),
         ("Admissions",       "Yield Rate",               "DVADM04", True,  _fmt_pct),
         ("Student Success",  "FT Retention Rate",        "RET_PCF", True,  _fmt_pct),
@@ -4867,11 +4762,11 @@ most actionable benchmark for strategic planning.
         ("Library",          "Physical Books per FTE",   "LPBOOKSP",True,  _fmt_num),
     ]
 
-    pct_col    = f"vs {peer_label[:30]} (pct)"   # truncate long cohort names in column header
+    pct_col    = f"vs {peer_label[:30]} (pct)"
     rating_col = "Rating"
 
     rows = []
-    for cat, name, col, hib, fmt in SCORECARD:
+    for cat, name, col, hib, fmt_fn in SCORECARD:
         if col is None:
             if name == "Pell vs Overall Gap":
                 v_pell    = _val("PGGRRTT")
@@ -4880,29 +4775,26 @@ most actionable benchmark for strategic planning.
                     gap_val    = v_pell - v_overall
                     gap_series = (peers["PGGRRTT"] - peers["GRRTTOT"]).dropna()
                     pct_peer   = _pct(gap_series, gap_val, higher_is_better=True)
-                    n_have     = len(gap_series)
                     rows.append({"Category": cat, "Metric": name,
-                                 "Albion Value": f"{gap_val:+.1f} pp",
-                                 pct_col: pct_peer, "n with data": n_have,
+                                 VAL_COL: f"{gap_val:+.1f} pp",
+                                 pct_col: pct_peer, "n with data": len(gap_series),
                                  rating_col: _badge(pct_peer)})
             elif name == "% URM Students":
                 urm_cols = ["PCTENRBK","PCTENRHS","PCTENRAN","PCTENR2M"]
-                alb_urm  = sum((_val(c) or 0) for c in urm_cols)
+                foc_urm  = sum((_val(c) or 0) for c in urm_cols)
                 peer_urm = peers[urm_cols].sum(axis=1, skipna=True)
-                pct_peer = _pct(peer_urm.dropna(), alb_urm, True)
-                n_have   = len(peer_urm.dropna())
+                pct_peer = _pct(peer_urm.dropna(), foc_urm, True)
                 rows.append({"Category": cat, "Metric": name,
-                             "Albion Value": f"{alb_urm:.1f}%",
-                             pct_col: pct_peer, "n with data": n_have,
+                             VAL_COL: f"{foc_urm:.1f}%",
+                             pct_col: pct_peer, "n with data": len(peer_urm.dropna()),
                              rating_col: _badge(pct_peer)})
             continue
         v        = _val(col)
         peer_ser = peers[col].dropna()
         pct_peer = _pct(peer_ser, v, hib)
-        n_have   = len(peer_ser)
         rows.append({"Category": cat, "Metric": name,
-                     "Albion Value": fmt(v),
-                     pct_col: pct_peer, "n with data": n_have,
+                     VAL_COL: fmt_fn(v),
+                     pct_col: pct_peer, "n with data": len(peer_ser),
                      rating_col: _badge(pct_peer)})
 
     sc_df = pd.DataFrame(rows)
@@ -4915,10 +4807,7 @@ most actionable benchmark for strategic planning.
             return ["background-color:#FEE2E2;color:#7F1D1D;font-weight:bold"] * len(r)
         return [""] * len(r)
 
-    st.dataframe(
-        sc_df.style.apply(_color_row, axis=1),
-        use_container_width=True, height=660,
-    )
+    st.dataframe(sc_df.style.apply(_color_row, axis=1), use_container_width=True, height=660)
     st.caption("🟢 Top 25% of peer group · 🟡 Middle 50% · 🔴 Bottom 25% · ⚪ No data available")
     st.divider()
 
@@ -4926,7 +4815,7 @@ most actionable benchmark for strategic planning.
     strengths  = sc_df[sc_df[rating_col].str.contains("Strength", na=False)]["Metric"].tolist()
     needs_attn = sc_df[sc_df[rating_col].str.contains("Needs",    na=False)]["Metric"].tolist()
 
-    st.subheader("Strengths — Where Albion Leads This Peer Group")
+    st.subheader(f"Strengths — Where {focus_name} Leads This Peer Group")
     if strengths:
         st.success(f"Top quartile vs. **{peer_label}** on: **{', '.join(strengths)}**")
     else:
@@ -4945,44 +4834,35 @@ most actionable benchmark for strategic planning.
 
     # ── Tab: Student Success ──────────────────────────────────────────────────
     with d1:
-        alb_ret  = _val("RET_PCF")
-        alb_gr6  = _val("GBA6RTT")
-        alb_gr15 = _val("GRRTTOT")
-        alb_om8  = _val("OM1TOTLAWDP8")
+        f_ret  = _val("RET_PCF")
+        f_gr6  = _val("GBA6RTT")
+        f_gr15 = _val("GRRTTOT")
+        f_om8  = _val("OM1TOTLAWDP8")
 
-        # Compute peer medians for comparison
         peer_ret_med  = peers["RET_PCF"].median(skipna=True)
         peer_gr6_med  = peers["GBA6RTT"].median(skipna=True)
         peer_gr15_med = peers["GRRTTOT"].median(skipna=True)
         peer_om8_med  = peers["OM1TOTLAWDP8"].median(skipna=True)
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("FT Retention", _fmt_pct(alb_ret),
-                  delta=f"{alb_ret - peer_ret_med:+.1f}pp vs peer median" if alb_ret and not pd.isna(peer_ret_med) else None)
-        c2.metric("6-yr Grad Rate", _fmt_pct(alb_gr6),
-                  delta=f"{alb_gr6 - peer_gr6_med:+.1f}pp vs peer median" if alb_gr6 and not pd.isna(peer_gr6_med) else None)
-        c3.metric("Grad Rate 150%", _fmt_pct(alb_gr15),
-                  delta=f"{alb_gr15 - peer_gr15_med:+.1f}pp vs peer median" if alb_gr15 and not pd.isna(peer_gr15_med) else None)
-        c4.metric("8-yr Award Rate", _fmt_pct(alb_om8),
-                  delta=f"{alb_om8 - peer_om8_med:+.1f}pp vs peer median" if alb_om8 and not pd.isna(peer_om8_med) else None)
+        c1.metric("FT Retention", _fmt_pct(f_ret),
+                  delta=f"{f_ret - peer_ret_med:+.1f}pp vs peer median" if f_ret and not pd.isna(peer_ret_med) else None)
+        c2.metric("6-yr Grad Rate", _fmt_pct(f_gr6),
+                  delta=f"{f_gr6 - peer_gr6_med:+.1f}pp vs peer median" if f_gr6 and not pd.isna(peer_gr6_med) else None)
+        c3.metric("Grad Rate 150%", _fmt_pct(f_gr15),
+                  delta=f"{f_gr15 - peer_gr15_med:+.1f}pp vs peer median" if f_gr15 and not pd.isna(peer_gr15_med) else None)
+        c4.metric("8-yr Award Rate", _fmt_pct(f_om8),
+                  delta=f"{f_om8 - peer_om8_med:+.1f}pp vs peer median" if f_om8 and not pd.isna(peer_om8_med) else None)
 
-        # Graduation rate distribution with Albion marker
         gr_hist = peers["GBA6RTT"].dropna()
-        if not gr_hist.empty and alb_gr6:
+        if not gr_hist.empty and f_gr6:
             fig = px.histogram(gr_hist, x="GBA6RTT", nbins=max(10, min(40, len(gr_hist)//2)),
                                title=f"6-Year Bachelor's Grad Rate — {peer_label}",
                                labels={"GBA6RTT": "6-yr Grad Rate (%)"})
             fig.update_layout(height=340, showlegend=False)
-            fig.add_vline(x=alb_gr6, line_color="#D97706", line_width=3, line_dash="dot",
-                          annotation_text="◆ Albion", annotation_position="top right",
-                          annotation_font_color="#92400E", annotation_font_size=12,
-                          annotation_bgcolor="rgba(253,230,138,0.92)")
-            fig.add_vline(x=float(gr_hist.median()), line_color="#6B7280", line_width=1.5, line_dash="dash",
-                          annotation_text="Peer median", annotation_position="top left",
-                          annotation_font_color="#374151", annotation_font_size=10)
+            _vline(fig, f_gr6, gr_hist)
             st.plotly_chart(fig, use_container_width=True)
 
-        # Retention vs Grad rate scatter
         sg = peers.dropna(subset=["RET_PCF", "GBA6RTT"]).copy()
         if not sg.empty:
             fig = px.scatter(sg, x="RET_PCF", y="GBA6RTT",
@@ -4992,69 +4872,61 @@ most actionable benchmark for strategic planning.
                                      "CONTROL_LBL": "Control"},
                              title=f"Retention vs. 6-yr Grad Rate — {peer_label}",
                              **_trend_kw())
-            if alb_ret and alb_gr6:
-                fig.add_trace(go.Scatter(
-                    x=[alb_ret], y=[alb_gr6], mode="markers+text",
-                    marker=dict(symbol="star", size=28, color="#F59E0B", line=dict(color="#1E3A5F", width=2.5)),
-                    text=["Albion College"], textposition="top right",
-                    textfont=dict(size=12, color="#1E3A5F", family="Arial Black"),
-                    name="Albion College", showlegend=True,
-                    hovertemplate="<b>Albion College</b><br>Retention: %{x:.1f}%<br>6-yr GR: %{y:.1f}%<extra></extra>",
-                ))
+            _note = _star(fig, f_ret, f_gr6, "Retention: %{x:.1f}%", "6-yr GR: %{y:.1f}%")
             fig.update_layout(height=420)
             st.plotly_chart(fig, use_container_width=True)
+            if _note:
+                st.caption(_note)
 
-        # Narrative insight
-        pct_gr6_sz = _pct(peers["GBA6RTT"], alb_gr6, True)
-        pct_ret_sz = _pct(peers["RET_PCF"], alb_ret, True)
-        n_gr6      = len(peers["GBA6RTT"].dropna())
-        q75_gr6    = peers["GBA6RTT"].quantile(0.75)
-        insight_lines = []
-        if pct_gr6_sz is not None:
-            insight_lines.append(
-                f"- Albion's **6-year graduation rate ({_fmt_pct(alb_gr6)})** ranks at the "
-                f"**{pct_gr6_sz}th percentile** among {n_gr6:,} institutions in *{peer_label}*. "
+        pct_gr6 = _pct(peers["GBA6RTT"], f_gr6, True)
+        pct_ret = _pct(peers["RET_PCF"], f_ret, True)
+        n_gr6   = len(peers["GBA6RTT"].dropna())
+        q75_gr6 = peers["GBA6RTT"].quantile(0.75)
+        lines = []
+        if pct_gr6 is not None:
+            lines.append(
+                f"- {focus_name}'s **6-year graduation rate ({_fmt_pct(f_gr6)})** ranks at the "
+                f"**{pct_gr6}th percentile** among {n_gr6:,} institutions in *{peer_label}*. "
                 + ("This is a genuine strength — fewer than 25% of peers graduate students at a higher rate."
-                   if pct_gr6_sz >= 75 else
+                   if pct_gr6 >= 75 else
                    f"There is meaningful room to improve: closing the gap to the 75th percentile threshold "
                    f"({_fmt_pct(q75_gr6)}) is a high-leverage opportunity."
-                   if pct_gr6_sz < 50 else
+                   if pct_gr6 < 50 else
                    f"Performance is solid but the top quartile threshold ({_fmt_pct(q75_gr6)}) is within reach.")
             )
-        if pct_ret_sz is not None:
-            insight_lines.append(
-                f"- **First-year retention ({_fmt_pct(alb_ret)})** is at the "
-                f"**{pct_ret_sz}th percentile** vs {peer_label}. "
+        if pct_ret is not None:
+            lines.append(
+                f"- **First-year retention ({_fmt_pct(f_ret)})** is at the "
+                f"**{pct_ret}th percentile** vs {peer_label}. "
                 + ("Retention is a strong signal of first-year student experience and a leading indicator "
-                   "for eventual graduation." if pct_ret_sz >= 60 else
+                   "for eventual graduation." if pct_ret >= 60 else
                    "First-year retention is the earliest leverage point for graduation outcomes. "
                    "Institutions that close this gap typically invest in structured first-year advising, "
                    "peer mentorship, and early-alert systems.")
             )
-        if insight_lines:
-            st.markdown("\n".join(insight_lines))
+        if lines:
+            st.markdown("\n".join(lines))
 
     # ── Tab: Equity & Access ──────────────────────────────────────────────────
     with d2:
-        alb_pell_pct   = _val("PGRNT_P")
-        alb_pell_gr    = _val("PGGRRTT")
-        alb_overall_gr = _val("GRRTTOT")
-        pell_gap       = (alb_pell_gr - alb_overall_gr) if (alb_pell_gr and alb_overall_gr) else None
-        urm_val        = sum((_val(c) or 0) for c in ["PCTENRBK","PCTENRHS","PCTENRAN","PCTENR2M"])
+        f_pell_pct   = _val("PGRNT_P")
+        f_pell_gr    = _val("PGGRRTT")
+        f_overall_gr = _val("GRRTTOT")
+        pell_gap     = (f_pell_gr - f_overall_gr) if (f_pell_gr and f_overall_gr) else None
+        urm_val      = sum((_val(c) or 0) for c in ["PCTENRBK","PCTENRHS","PCTENRAN","PCTENR2M"])
 
         peer_pell_pct_med = peers["PGRNT_P"].median(skipna=True)
         peer_pell_gr_med  = peers["PGGRRTT"].median(skipna=True)
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("% Pell Recipients", _fmt_pct(alb_pell_pct),
-                  delta=f"{alb_pell_pct - peer_pell_pct_med:+.1f}pp vs peer median" if alb_pell_pct and not pd.isna(peer_pell_pct_med) else None)
-        c2.metric("Pell Grad Rate",    _fmt_pct(alb_pell_gr),
-                  delta=f"{alb_pell_gr - peer_pell_gr_med:+.1f}pp vs peer median" if alb_pell_gr and not pd.isna(peer_pell_gr_med) else None)
+        c1.metric("% Pell Recipients", _fmt_pct(f_pell_pct),
+                  delta=f"{f_pell_pct - peer_pell_pct_med:+.1f}pp vs peer median" if f_pell_pct and not pd.isna(peer_pell_pct_med) else None)
+        c2.metric("Pell Grad Rate",    _fmt_pct(f_pell_gr),
+                  delta=f"{f_pell_gr - peer_pell_gr_med:+.1f}pp vs peer median" if f_pell_gr and not pd.isna(peer_pell_gr_med) else None)
         c3.metric("Pell vs Overall Gap", f"{pell_gap:+.1f}pp" if pell_gap is not None else "—",
                   help="Negative = Pell students graduate at lower rate than overall. Smaller gap = better equity.")
         c4.metric("% URM Students", f"{urm_val:.1f}%")
 
-        # Pell gap scatter: % Pell enrolled vs Pell grad rate
         eq_df = peers.dropna(subset=["PGRNT_P","PGGRRTT"]).copy()
         if not eq_df.empty:
             fig = px.scatter(eq_df, x="PGRNT_P", y="PGGRRTT",
@@ -5063,52 +4935,38 @@ most actionable benchmark for strategic planning.
                              labels={"PGRNT_P": "% Pell Recipients", "PGGRRTT": "Pell Grad Rate (%)"},
                              title=f"Pell Enrollment vs. Pell Graduation Rate — {peer_label}",
                              **_trend_kw())
-            if alb_pell_pct and alb_pell_gr:
-                fig.add_trace(go.Scatter(
-                    x=[alb_pell_pct], y=[alb_pell_gr], mode="markers+text",
-                    marker=dict(symbol="star", size=28, color="#F59E0B", line=dict(color="#1E3A5F", width=2.5)),
-                    text=["Albion College"], textposition="top right",
-                    textfont=dict(size=12, color="#1E3A5F", family="Arial Black"),
-                    name="Albion College", showlegend=True,
-                    hovertemplate="<b>Albion College</b><br>% Pell: %{x:.1f}%<br>Pell GR: %{y:.1f}%<extra></extra>",
-                ))
+            _note = _star(fig, f_pell_pct, f_pell_gr, "% Pell: %{x:.1f}%", "Pell GR: %{y:.1f}%")
             fig.update_layout(height=420)
             st.plotly_chart(fig, use_container_width=True)
+            if _note:
+                st.caption(_note)
 
-        # Pell graduation rate distribution
         pell_hist = peers["PGGRRTT"].dropna()
-        if not pell_hist.empty and alb_pell_gr:
+        if not pell_hist.empty and f_pell_gr:
             fig = px.histogram(pell_hist, x="PGGRRTT", nbins=max(10, min(40, len(pell_hist)//2)),
                                title=f"Pell Graduation Rate Distribution — {peer_label}",
                                labels={"PGGRRTT": "Pell Grad Rate (%)"})
             fig.update_layout(height=300, showlegend=False)
-            fig.add_vline(x=alb_pell_gr, line_color="#D97706", line_width=3, line_dash="dot",
-                          annotation_text="◆ Albion", annotation_position="top right",
-                          annotation_font_color="#92400E", annotation_font_size=12,
-                          annotation_bgcolor="rgba(253,230,138,0.92)")
-            fig.add_vline(x=float(pell_hist.median()), line_color="#6B7280", line_width=1.5, line_dash="dash",
-                          annotation_text="Peer median", annotation_position="top left",
-                          annotation_font_color="#374151", annotation_font_size=10)
+            _vline(fig, f_pell_gr, pell_hist)
             st.plotly_chart(fig, use_container_width=True)
 
-        # Narrative
-        pct_pell_gr_sz  = _pct(peers["PGGRRTT"], alb_pell_gr, True)
-        pct_pell_pct_sz = _pct(peers["PGRNT_P"], alb_pell_pct, True)
+        pct_pell_gr  = _pct(peers["PGGRRTT"], f_pell_gr, True)
+        pct_pell_pct = _pct(peers["PGRNT_P"], f_pell_pct, True)
         lines = []
-        if pct_pell_pct_sz is not None:
+        if pct_pell_pct is not None:
             lines.append(
-                f"- Albion enrolls **{_fmt_pct(alb_pell_pct)} Pell recipients**, placing it at the "
-                f"**{pct_pell_pct_sz}th percentile** for economic access within *{peer_label}*. "
+                f"- {focus_name} enrolls **{_fmt_pct(f_pell_pct)} Pell recipients**, placing it at the "
+                f"**{pct_pell_pct}th percentile** for economic access within *{peer_label}*. "
                 + ("This signals a meaningful commitment to first-generation and low-income students."
-                   if pct_pell_pct_sz >= 60 else
+                   if pct_pell_pct >= 60 else
                    "There may be room to strengthen recruitment pipelines for first-generation and low-income students.")
             )
-        if pct_pell_gr_sz is not None:
+        if pct_pell_gr is not None:
             lines.append(
-                f"- The **Pell graduation rate ({_fmt_pct(alb_pell_gr)})** ranks at the "
-                f"**{pct_pell_gr_sz}th percentile** vs {peer_label}. "
-                + ("This is a strong equity outcome — Albion graduates its Pell students at a high rate relative to peers."
-                   if pct_pell_gr_sz >= 65 else
+                f"- The **Pell graduation rate ({_fmt_pct(f_pell_gr)})** ranks at the "
+                f"**{pct_pell_gr}th percentile** vs {peer_label}. "
+                + ("This is a strong equity outcome — Pell students graduate at a high rate relative to peers."
+                   if pct_pell_gr >= 65 else
                    "The equity graduation gap is an area warranting investment. High-impact practices — "
                    "intrusive advising, emergency aid funds, cohort-based learning communities — have "
                    "demonstrated evidence of closing Pell graduation gaps at peer institutions.")
@@ -5117,52 +4975,42 @@ most actionable benchmark for strategic planning.
             lines.append(
                 f"- The **Pell gap is {pell_gap:+.1f} percentage points** "
                 f"(Pell grad rate minus overall grad rate). "
-                + ("A gap this small signals that Albion does not systematically disadvantage low-income students in completion outcomes."
+                + ("A gap this small signals that low-income students are not systematically disadvantaged in completion outcomes."
                    if pell_gap > -5 else
-                   "A gap of this magnitude is a structural equity risk. It means that students who rely "
-                   "on Pell Grants — typically from lower-income families — are completing at meaningfully "
-                   "lower rates than their peers, even at the same institution.")
+                   "A gap of this magnitude is a structural equity risk: students who rely on Pell Grants are "
+                   "completing at meaningfully lower rates than their peers, even at the same institution.")
             )
         if lines:
             st.markdown("\n".join(lines))
 
     # ── Tab: Costs & Value ────────────────────────────────────────────────────
     with d3:
-        alb_coa    = _val("CINSON")
-        alb_tui    = _val("TUFEYR3")
-        alb_pell_a = _val("PGRNT_A")
-        alb_grant_a = _val("AGRNT_A")
-        alb_loan_p = _val("LOAN_P")
+        f_coa     = _val("CINSON")
+        f_tui     = _val("TUFEYR3")
+        f_grant_a = _val("AGRNT_A")
+        f_loan_p  = _val("LOAN_P")
 
-        peer_coa_med    = peers["CINSON"].median(skipna=True)
-        peer_grant_med  = peers["AGRNT_A"].median(skipna=True)
+        peer_coa_med   = peers["CINSON"].median(skipna=True)
+        peer_grant_med = peers["AGRNT_A"].median(skipna=True)
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("In-State COA", _fmt_dollar(alb_coa),
-                  delta=f"{(alb_coa or 0) - peer_coa_med:+,.0f} vs peer median" if alb_coa and not pd.isna(peer_coa_med) else None)
-        c2.metric(f"Tuition {year}", _fmt_dollar(alb_tui))
-        c3.metric("Avg Any Grant",   _fmt_dollar(alb_grant_a),
-                  delta=f"{(alb_grant_a or 0) - peer_grant_med:+,.0f} vs peer median" if alb_grant_a and not pd.isna(peer_grant_med) else None)
-        c4.metric("% Taking Loans",  _fmt_pct(alb_loan_p))
+        c1.metric("In-State COA", _fmt_dollar(f_coa),
+                  delta=f"{(f_coa or 0) - peer_coa_med:+,.0f} vs peer median" if f_coa and not pd.isna(peer_coa_med) else None)
+        c2.metric(f"Tuition {year}", _fmt_dollar(f_tui))
+        c3.metric("Avg Any Grant",   _fmt_dollar(f_grant_a),
+                  delta=f"{(f_grant_a or 0) - peer_grant_med:+,.0f} vs peer median" if f_grant_a and not pd.isna(peer_grant_med) else None)
+        c4.metric("% Taking Loans",  _fmt_pct(f_loan_p))
 
-        # COA distribution with Albion
         coa_hist = peers["CINSON"].dropna()
-        if not coa_hist.empty and alb_coa:
+        if not coa_hist.empty and f_coa:
             fig = px.histogram(coa_hist, x="CINSON", nbins=max(10, min(40, len(coa_hist)//2)),
                                title=f"In-State COA Distribution — {peer_label}",
                                labels={"CINSON": "In-State COA ($)"})
             fig.update_layout(height=300, showlegend=False)
             fig.update_xaxes(tickprefix="$", tickformat=",.0f")
-            fig.add_vline(x=alb_coa, line_color="#D97706", line_width=3, line_dash="dot",
-                          annotation_text="◆ Albion", annotation_position="top right",
-                          annotation_font_color="#92400E", annotation_font_size=12,
-                          annotation_bgcolor="rgba(253,230,138,0.92)")
-            fig.add_vline(x=float(coa_hist.median()), line_color="#6B7280", line_width=1.5, line_dash="dash",
-                          annotation_text="Peer median", annotation_position="top left",
-                          annotation_font_color="#374151", annotation_font_size=10)
+            _vline(fig, f_coa, coa_hist)
             st.plotly_chart(fig, use_container_width=True)
 
-        # COA vs avg grant scatter — "value" story
         vdf = peers.dropna(subset=["CINSON","AGRNT_A"]).copy()
         if not vdf.empty:
             fig = px.scatter(vdf, x="CINSON", y="AGRNT_A",
@@ -5171,77 +5019,69 @@ most actionable benchmark for strategic planning.
                              labels={"CINSON": "In-State COA ($)", "AGRNT_A": "Avg Grant Aid ($)"},
                              title=f"Cost vs. Grant Aid Generosity — {peer_label}",
                              **_trend_kw())
-            if alb_coa and alb_grant_a:
-                fig.add_trace(go.Scatter(
-                    x=[alb_coa], y=[alb_grant_a], mode="markers+text",
-                    marker=dict(symbol="star", size=28, color="#F59E0B", line=dict(color="#1E3A5F", width=2.5)),
-                    text=["Albion College"], textposition="top right",
-                    textfont=dict(size=12, color="#1E3A5F", family="Arial Black"),
-                    name="Albion College", showlegend=True,
-                    hovertemplate="<b>Albion College</b><br>COA: $%{x:,.0f}<br>Avg Grant: $%{y:,.0f}<extra></extra>",
-                ))
+            _note = _star(fig, f_coa, f_grant_a, "COA: $%{x:,.0f}", "Avg Grant: $%{y:,.0f}")
             fig.update_layout(height=400)
             fig.update_xaxes(tickprefix="$", tickformat=",.0f")
             fig.update_yaxes(tickprefix="$", tickformat=",.0f")
             st.plotly_chart(fig, use_container_width=True)
+            if _note:
+                st.caption(_note)
             st.caption(
                 "Institutions **above the trend line** offer more generous grant aid than peers at the same sticker price — "
                 "a key signal of 'hidden value.' Institutions **below the line** may appear affordable but under-fund students."
             )
 
-        # Narrative
-        pct_coa_sz   = _pct(peers["CINSON"], alb_coa, False)
-        pct_grant_sz = _pct(peers["AGRNT_A"], alb_grant_a, True)
-        pct_loan_sz  = _pct(peers["LOAN_P"], alb_loan_p, False)
+        pct_coa   = _pct(peers["CINSON"], f_coa, False)
+        pct_grant = _pct(peers["AGRNT_A"], f_grant_a, True)
+        pct_loan  = _pct(peers["LOAN_P"], f_loan_p, False)
         lines = []
-        if pct_coa_sz is not None:
+        if pct_coa is not None:
             lines.append(
-                f"- Albion's **in-state COA ({_fmt_dollar(alb_coa)})** ranks at the **{pct_coa_sz}th percentile** "
+                f"- {focus_name}'s **in-state COA ({_fmt_dollar(f_coa)})** ranks at the **{pct_coa}th percentile** "
                 f"for affordability within *{peer_label}* (100 = most affordable). "
-                + ("Albion is among the more affordable colleges in this peer group."
-                   if pct_coa_sz >= 60 else
-                   "Albion's sticker price is above the peer median. The critical question is whether grant aid brings the net price down to a competitive level.")
+                + ("It is among the more affordable colleges in this peer group."
+                   if pct_coa >= 60 else
+                   "The sticker price is above the peer median. The critical question is whether grant aid brings the net price down to a competitive level.")
             )
-        if pct_grant_sz is not None:
+        if pct_grant is not None:
             lines.append(
-                f"- **Average grant aid ({_fmt_dollar(alb_grant_a)})** ranks at the **{pct_grant_sz}th percentile** "
+                f"- **Average grant aid ({_fmt_dollar(f_grant_a)})** ranks at the **{pct_grant}th percentile** "
                 f"vs {peer_label}. "
                 + ("Grant generosity is a genuine competitive differentiator — it can offset a higher sticker price and is a powerful enrollment lever."
-                   if pct_grant_sz >= 65 else
-                   "Grant aid falls below the peer median. If the sticker price is also above average, the combination creates a net-price disadvantage in recruitment — particularly for middle-income families who don't qualify for Pell but need aid.")
+                   if pct_grant >= 65 else
+                   "Grant aid falls below the peer median. If the sticker price is also above average, the combination creates a net-price disadvantage in recruitment.")
             )
-        if pct_loan_sz is not None:
+        if pct_loan is not None:
             lines.append(
-                f"- **{_fmt_pct(alb_loan_p)} of students take out loans**, ranking at the **{pct_loan_sz}th percentile** "
+                f"- **{_fmt_pct(f_loan_p)} of students take out loans**, ranking at the **{pct_loan}th percentile** "
                 f"for low loan reliance vs {peer_label} (100 = fewest students borrowing). "
                 + ("A lower loan rate suggests that grant aid and family resources are adequate for most students."
-                   if pct_loan_sz >= 55 else
-                   "A higher-than-average loan rate may signal that aid packages are not keeping up with costs, creating financial stress that can impair retention and graduation.")
+                   if pct_loan >= 55 else
+                   "A higher-than-average loan rate may signal that aid packages are not keeping up with costs, creating financial stress that can impair retention.")
             )
         if lines:
             st.markdown("\n".join(lines))
 
     # ── Tab: Faculty & Resources ──────────────────────────────────────────────
     with d4:
-        alb_sal   = _val("SALTOTL")
-        alb_sfr   = _val("STUFACR")
-        alb_libx  = _val("LEXPTOTF")
-        alb_ebook = _val("LEBOOKSP")
+        f_sal   = _val("SALTOTL")
+        f_sfr   = _val("STUFACR")
+        f_libx  = _val("LEXPTOTF")
+        f_ebook = _val("LEBOOKSP")
 
         peer_sal_med  = peers["SALTOTL"].median(skipna=True)
         peer_sfr_med  = peers["STUFACR"].median(skipna=True)
         peer_libx_med = peers["LEXPTOTF"].median(skipna=True)
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Avg Faculty Salary", _fmt_dollar(alb_sal),
-                  delta=f"{(alb_sal or 0) - peer_sal_med:+,.0f} vs peer median" if alb_sal and not pd.isna(peer_sal_med) else None)
-        c2.metric("Student:Faculty Ratio", _fmt_num(alb_sfr, 0) + ":1" if alb_sfr else "—",
-                  delta=f"{(alb_sfr or 0) - peer_sfr_med:+.1f} vs peer median (lower is better)" if alb_sfr and not pd.isna(peer_sfr_med) else None)
-        c3.metric("Library Expend/FTE", _fmt_dollar(alb_libx),
-                  delta=f"{(alb_libx or 0) - peer_libx_med:+,.0f} vs peer median" if alb_libx and not pd.isna(peer_libx_med) else None)
-        c4.metric("E-Books per FTE", _fmt_num(alb_ebook))
+        c1.metric("Avg Faculty Salary", _fmt_dollar(f_sal),
+                  delta=f"{(f_sal or 0) - peer_sal_med:+,.0f} vs peer median" if f_sal and not pd.isna(peer_sal_med) else None)
+        c2.metric("Student:Faculty Ratio", _fmt_num(f_sfr, 0) + ":1" if f_sfr else "—",
+                  delta=f"{(f_sfr or 0) - peer_sfr_med:+.1f} vs peer median (lower is better)" if f_sfr and not pd.isna(peer_sfr_med) else None)
+        c3.metric("Library Expend/FTE", _fmt_dollar(f_libx),
+                  delta=f"{(f_libx or 0) - peer_libx_med:+,.0f} vs peer median" if f_libx and not pd.isna(peer_libx_med) else None)
+        c4.metric("E-Books per FTE", _fmt_num(f_ebook))
 
-        # Salary vs student:faculty scatter
         fdf = peers.dropna(subset=["SALTOTL","STUFACR"]).copy()
         if not fdf.empty:
             fig = px.scatter(fdf, x="STUFACR", y="SALTOTL",
@@ -5249,63 +5089,50 @@ most actionable benchmark for strategic planning.
                              color_discrete_sequence=["#7C3AED"],
                              labels={"STUFACR": "Student:Faculty Ratio", "SALTOTL": "Avg Faculty Salary ($)"},
                              title=f"Class Size vs. Faculty Compensation — {peer_label}")
-            if alb_sfr and alb_sal:
-                fig.add_trace(go.Scatter(
-                    x=[alb_sfr], y=[alb_sal], mode="markers+text",
-                    marker=dict(symbol="star", size=28, color="#F59E0B", line=dict(color="#1E3A5F", width=2.5)),
-                    text=["Albion College"], textposition="top right",
-                    textfont=dict(size=12, color="#1E3A5F", family="Arial Black"),
-                    name="Albion College", showlegend=True,
-                    hovertemplate="<b>Albion College</b><br>S:F Ratio: %{x:.0f}<br>Salary: $%{y:,.0f}<extra></extra>",
-                ))
+            _note = _star(fig, f_sfr, f_sal, "S:F Ratio: %{x:.0f}", "Salary: $%{y:,.0f}")
             fig.update_layout(height=400)
             fig.update_yaxes(tickprefix="$", tickformat=",.0f")
             st.plotly_chart(fig, use_container_width=True)
+            if _note:
+                st.caption(_note)
 
-        # Library expend distribution
         lib_hist = peers["LEXPTOTF"].dropna()
-        if not lib_hist.empty and alb_libx:
+        if not lib_hist.empty and f_libx:
             fig = px.histogram(lib_hist, x="LEXPTOTF", nbins=max(10, min(40, len(lib_hist)//2)),
                                title=f"Library Expenditures per FTE — {peer_label}",
                                labels={"LEXPTOTF": "Library Expend/FTE ($)"})
             fig.update_layout(height=300, showlegend=False)
             fig.update_xaxes(tickprefix="$", tickformat=",.0f")
-            fig.add_vline(x=alb_libx, line_color="#D97706", line_width=3, line_dash="dot",
-                          annotation_text="◆ Albion", annotation_position="top right",
-                          annotation_font_color="#92400E", annotation_font_size=12,
-                          annotation_bgcolor="rgba(253,230,138,0.92)")
-            fig.add_vline(x=float(lib_hist.median()), line_color="#6B7280", line_width=1.5, line_dash="dash",
-                          annotation_text="Peer median", annotation_position="top left",
-                          annotation_font_color="#374151", annotation_font_size=10)
+            _vline(fig, f_libx, lib_hist)
             st.plotly_chart(fig, use_container_width=True)
 
-        pct_sal_sz  = _pct(peers["SALTOTL"], alb_sal, True)
-        pct_sfr_sz  = _pct(peers["STUFACR"], alb_sfr, False)
-        pct_libx_sz = _pct(peers["LEXPTOTF"], alb_libx, True)
+        pct_sal  = _pct(peers["SALTOTL"], f_sal, True)
+        pct_sfr  = _pct(peers["STUFACR"], f_sfr, False)
+        pct_libx = _pct(peers["LEXPTOTF"], f_libx, True)
         lines = []
-        if pct_sfr_sz is not None:
+        if pct_sfr is not None:
             lines.append(
-                f"- Albion's **student-to-faculty ratio ({_fmt_num(alb_sfr, 0)}:1)** ranks at the "
-                f"**{pct_sfr_sz}th percentile** for small class size within *{peer_label}*. "
-                + ("A low ratio is Albion's structural teaching advantage — it enables the faculty-student mentorship that defines liberal arts education and that larger institutions cannot easily replicate."
-                   if pct_sfr_sz >= 60 else
-                   "The ratio is above the peer median, which may dilute the individualized attention that is the core value proposition of a small liberal arts college.")
+                f"- {focus_name}'s **student-to-faculty ratio ({_fmt_num(f_sfr, 0)}:1)** ranks at the "
+                f"**{pct_sfr}th percentile** for small class size within *{peer_label}*. "
+                + ("A low ratio is a structural teaching advantage — it enables the faculty-student mentorship that larger institutions cannot easily replicate."
+                   if pct_sfr >= 60 else
+                   "The ratio is above the peer median, which may dilute the individualized attention that small institutions rely on as a value proposition.")
             )
-        if pct_sal_sz is not None:
+        if pct_sal is not None:
             lines.append(
-                f"- **Average faculty salary ({_fmt_dollar(alb_sal)})** ranks at the **{pct_sal_sz}th percentile** "
+                f"- **Average faculty salary ({_fmt_dollar(f_sal)})** ranks at the **{pct_sal}th percentile** "
                 f"vs {peer_label}. "
-                + ("Competitive compensation helps attract and retain high-quality instructors — a direct input to academic quality and student experience."
-                   if pct_sal_sz >= 55 else
-                   "Faculty compensation below the peer median creates recruitment risk. In a competitive market for liberal arts faculty, salary gaps compound over time as top candidates choose better-compensated alternatives.")
+                + ("Competitive compensation helps attract and retain high-quality instructors — a direct input to academic quality."
+                   if pct_sal >= 55 else
+                   "Faculty compensation below the peer median creates recruitment risk; salary gaps compound over time as top candidates choose better-compensated alternatives.")
             )
-        if pct_libx_sz is not None:
+        if pct_libx is not None:
             lines.append(
-                f"- **Library expenditures per FTE student ({_fmt_dollar(alb_libx)})** rank at the **{pct_libx_sz}th percentile** "
+                f"- **Library expenditures per FTE student ({_fmt_dollar(f_libx)})** rank at the **{pct_libx}th percentile** "
                 f"vs {peer_label}. "
                 + ("Strong library investment per student signals serious commitment to research infrastructure for undergraduates."
-                   if pct_libx_sz >= 60 else
-                   "Library resource investment per student is below the peer median. For a research-oriented liberal arts college, library resources are a direct enabler of undergraduate research and scholarship.")
+                   if pct_libx >= 60 else
+                   "Library resource investment per student is below the peer median — a direct enabler of undergraduate research and scholarship.")
             )
         if lines:
             st.markdown("\n".join(lines))
@@ -5320,12 +5147,12 @@ most actionable benchmark for strategic planning.
             if not match.empty:
                 row = match.iloc[0]
                 st.markdown(
-                    f"**{m}** — Albion is at the **{row[pct_col]}th percentile** "
-                    f"vs {peer_label}. Current value: **{row['Albion Value']}**."
+                    f"**{m}** — {focus_name} is at the **{row[pct_col]}th percentile** "
+                    f"vs {peer_label}. Current value: **{row[VAL_COL]}**."
                 )
     else:
         st.success(
-            f"Albion College performs in the top 40% of **{peer_label}** on all tracked metrics. "
+            f"{focus_name} performs in the top 40% of **{peer_label}** on all tracked metrics. "
             "The strategic focus should be on sustaining current strengths while targeting the "
             "gap between average and top-quartile performance."
         )
@@ -5369,16 +5196,14 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    cohort_groups = load_cohort()
-
     if "page" not in st.session_state:
-        st.session_state["page"] = "National Overview"
+        st.session_state["page"] = "Institution of Interest Analysis"
     if "sel_inst" not in st.session_state:
         st.session_state["sel_inst"] = None
 
     st.sidebar.title("🎓 IPEDS Dashboard")
-    pages = ["National Overview", "Institution Profile", "Compare Institutions",
-             "Albion Analysis", "Year-over-Year"]
+    pages = ["Institution of Interest Analysis", "National Overview", "Institution Profile",
+             "Year-over-Year"]
     page_idx = pages.index(st.session_state["page"]) if st.session_state["page"] in pages else 0
     page = st.sidebar.radio(
         "Navigate",
@@ -5390,8 +5215,43 @@ def main():
         st.session_state["page"] = page
     st.sidebar.divider()
 
+    # ── Global "Institution of Interest" (drives the Analysis page + highlights) ──
+    _PLACEHOLDER = "— select an institution —"
+    _name_df = (load_master("2024-25")[["UNITID", "INSTNM", "DISPLAY_NAME"]]
+                .dropna(subset=["DISPLAY_NAME"]).drop_duplicates("UNITID").sort_values("DISPLAY_NAME"))
+    _display_names = _name_df["DISPLAY_NAME"].tolist()
+
+    st.sidebar.markdown("**🎯 Institution of Interest**")
+    _typed = st.sidebar.text_input(
+        "Type to narrow", key="focus_filter",
+        placeholder="Type a name or state to narrow…", label_visibility="collapsed")
+    _filt = [n for n in _display_names if _typed.lower() in n.lower()] if _typed else list(_display_names)
+    _prev = st.session_state.get("focus_display")
+    if _prev and _prev not in _filt and _prev in _display_names:
+        _filt = [_prev] + _filt
+    _options = [_PLACEHOLDER] + _filt
+    _idx = _options.index(_prev) if _prev in _options else 0
+    _focus_sel = st.sidebar.selectbox(
+        "Institution of Interest", _options, index=_idx, label_visibility="collapsed",
+        help="Pick any institution; the Analysis, Overview, Profile, Compare and Year-over-Year "
+             "pages center on it. Leave unset to browse without a focus.",
+    )
+    if _focus_sel == _PLACEHOLDER:
+        st.session_state["focus_display"] = None
+        st.session_state["focus_unitid"]  = None
+        st.session_state["focus_name"]    = None
+    else:
+        if _focus_sel != st.session_state.get("focus_display"):
+            st.session_state["sel_inst"] = _focus_sel   # sync Institution Profile selector
+        st.session_state["focus_display"] = _focus_sel
+        _r = _name_df[_name_df["DISPLAY_NAME"] == _focus_sel].iloc[0]
+        st.session_state["focus_unitid"] = int(_r["UNITID"])
+        st.session_state["focus_name"]   = str(_r["INSTNM"])
+    st.sidebar.divider()
+
     # ── Determine selected data year for this page ────────────────────────────
-    _YEAR_PAGES = {"National Overview", "Institution Profile", "Compare Institutions", "Albion Analysis"}
+    _YEAR_PAGES = {"Institution of Interest Analysis", "National Overview",
+                   "Institution Profile"}
     if page in _YEAR_PAGES:
         year = st.session_state.get(f"year_{page}", "2024-25")
     else:
@@ -5402,23 +5262,27 @@ def main():
         df = load_master(year)
 
     # ── Apply sidebar filters ─────────────────────────────────────────────────
-    if page in ("National Overview", "Compare Institutions"):
-        df_filtered, sel_groups = apply_filters(df.copy(), cohort_groups)
+    if page == "National Overview":
+        df_filtered, sel_groups = apply_filters(df.copy())
     elif page != "Year-over-Year":
         df_filtered = df
         sel_groups = []
 
     # ── Route to page ─────────────────────────────────────────────────────────
-    if page == "National Overview":
+    if page == "Institution of Interest Analysis":
+        _fuid = st.session_state.get("focus_unitid")
+        if not _fuid:
+            st.title("Institution of Interest — Strategic Performance Analysis")
+            st.info("👈 Pick an **Institution of Interest** in the sidebar to begin — "
+                    "then choose or accept the recommended peer institutions to compare against.")
+        else:
+            page_strategic(df, _fuid, st.session_state.get("focus_name") or "", year)
+    elif page == "National Overview":
         page_overview(df_filtered, sel_groups, year)
     elif page == "Institution Profile":
         page_profile(df_filtered, year)
-    elif page == "Compare Institutions":
-        page_compare(df_filtered, cohort_groups, year)
-    elif page == "Albion Analysis":
-        page_albion(df, cohort_groups, year)
     else:
-        page_trends(cohort_groups)
+        page_trends()
 
     # ── Sidebar footer ────────────────────────────────────────────────────────
     st.sidebar.divider()
@@ -5439,14 +5303,24 @@ def main():
     else:
         st.sidebar.caption("**DB:** not found")
 
-    if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+    # Refresh only deletes the on-disk DB when it can be re-downloaded (Cloud has a
+    # GDRIVE_DB_ID secret). Locally there is no remote source, so deleting it would be
+    # unrecoverable — there we just clear the cache and re-read the existing file.
+    try:
+        _has_remote = bool(st.secrets.get("GDRIVE_DB_ID", None))
+    except Exception:
+        _has_remote = False
+    if st.sidebar.button("🔄 Refresh Data", use_container_width=True,
+                         help=("Re-downloads the database from Google Drive." if _has_remote
+                               else "Clears the cache and re-reads the local database (the local "
+                                    "file is NOT deleted).")):
         st.cache_data.clear()
-        if os.path.exists(DB_PATH):
+        if _has_remote and os.path.exists(DB_PATH):
             os.remove(DB_PATH)
         st.rerun()
     st.sidebar.markdown(
         "<div style='font-size:0.82rem;color:#6B7280;text-align:center;line-height:1.5;padding-top:6px;'>"
-        "Built by <strong>Albion College</strong><br>Office of Institutional Research"
+        "IPEDS Interactive Dashboard<br>Built by Nan Dong, dongnan2017@gmail.com"
         "</div>",
         unsafe_allow_html=True,
     )
