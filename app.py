@@ -2075,11 +2075,10 @@ def page_profile(df: pd.DataFrame, year: str = "2024-25"):
                  key="year_Institution Profile", label_visibility="collapsed")
 
     names = sorted(df["DISPLAY_NAME"].dropna().unique().tolist())
-    pre = st.session_state.get("sel_inst")
-    if not pre:
-        # Default to Albion College if present in the filtered set
-        albion_matches = [n for n in names if "Albion College" in n]
-        pre = albion_matches[0] if albion_matches else None
+    # Open on the Institution of Interest (focus_display is a DISPLAY_NAME,
+    # the same value this selectbox lists). Falls back to the placeholder when
+    # no Institution of Interest has been chosen.
+    pre = st.session_state.get("sel_inst") or st.session_state.get("focus_display") or None
     default_idx = (names.index(pre) + 1) if pre and pre in names else 0
     sel = st.selectbox("Search for an institution", ["— select an institution —"] + names,
                        index=default_idx)
