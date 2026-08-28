@@ -11,6 +11,8 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
 
+from auth import require_password
+
 # Larger, more readable default for every plotly figure in the app
 pio.templates["ipeds"] = go.layout.Template(
     layout=go.Layout(
@@ -129,6 +131,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+require_password()
 # ── Categorical decodings ────────────────────────────────────────────────────
 SECTOR_MAP = {
     1: "Public 4-year+",      2: "Private NP 4-year+",   3: "Private FP 4-year+",
